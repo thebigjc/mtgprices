@@ -4,7 +4,9 @@ import (
 	"code.google.com/p/go-charset/charset"
 	_ "code.google.com/p/go-charset/data"
 	"database/sql"
+	"flag"
 	"fmt"
+	"github.com/coopernurse/gorp"
 	_ "github.com/mattn/go-sqlite3"
 	"io/ioutil"
 	"log"
@@ -13,12 +15,36 @@ import (
 	"strings"
 )
 
-func (c *card) save(stmt *sql.Stmt, ts string) {
-	_, err := stmt.Exec(c.name, c.set, c.buyPrice, c.sellPrice, c.stock, ts)
+type Card struct {
+	Rowid     int64 `db:"Rowid"`
+	Name      string
+	SetName   string `db:"set_name"`
+	BuyPrice  int    `db:"buy"`
+	SellPrice int    `db:"sell"`
+	Stock     int
+	Clean     bool
+	Ts        string
+}
 
+func checkErr(err error, msg string) {
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalln(msg, err)
 	}
+}
+
+func (c *Card) save(dbmap *gorp.DbMap, ts string) {
+	c.Ts = ts
+	err := dbmap.Insert(c)
+	checkErr(err, "Save failed")
+}
+
+func (c *Card) same_name(t *Card) bool {
+	return c.Name == t.Name && c.SetName == t.SetName
+}
+
+func (c *Card) same_details(t *Card) bool {
+	return c.same_name(t) && c.BuyPrice == t.BuyPrice &&
+		c.SellPrice == t.SellPrice && c.Stock == t.Stock
 }
 
 func strToFixed(s string) int {
@@ -54,12 +80,96 @@ func strToFixed(s string) int {
 	return int(a)
 }
 
-func main() {
-	db, err := sql.Open("sqlite3", "./card.db")
+var shouldClean bool
+var shouldTrace bool
+
+func init() {
+	flag.BoolVar(&shouldClean, "clean", false, "Clean the database instead of loading new prices")
+	flag.BoolVar(&shouldTrace, "trace", false, "Trace sql commands")
+}
+
+func cleanCard(name, set string, stmt *sql.Stmt) {
+	fmt.Println(name, set)
+	rows, err := stmt.Query(name, set)
+
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var rowid, buy, sell, stock int
+
+		err := rows.Scan(&rowid, &buy, &sell, &stock)
+
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		fmt.Println(rowid, buy, sell, stock)
+	}
+}
+
+func clean(db *gorp.DbMap) {
+	var cards []Card
+
+	_, err := db.Select(&cards, "select rowid,* from card_prices order by name, set_name, ts")
+
+	checkErr(err, "Selecting cards")
+
+	fmt.Printf("Found %d cards\n", len(cards))
+
+	if len(cards) < 1 {
+		return
+	}
+
+	last_card := cards[0]
+
+	for _, card := range cards[1:] {
+		if card.same_name(&last_card) {
+			if card.same_details(&last_card) {
+				db.Delete(&card)
+			}
+
+			if !last_card.Clean {
+				last_card.Clean = true
+				db.Update(&last_card)
+			}
+		}
+
+		last_card = card
+	}
+}
+
+func initDb() *gorp.DbMap {
+	db, err := sql.Open("sqlite3", "./card.db")
+	checkErr(err, "sql.Open failed")
+
+	dbmap := &gorp.DbMap{Db: db, Dialect: gorp.SqliteDialect{}}
+
+	dbmap.AddTableWithName(Card{}, "card_prices").SetKeys(true, "Rowid")
+
+	err = dbmap.CreateTablesIfNotExists()
+	checkErr(err, "Creating tables")
+
+	if shouldTrace {
+		dbmap.TraceOn("[gorp]", log.New(os.Stdout, "mtgprices:", log.Lmicroseconds))
+	}
+
+	return dbmap
+}
+
+func main() {
+	flag.Parse()
+
+	dbmap := initDb()
+	defer dbmap.Db.Close()
+
+	if shouldClean {
+		clean(dbmap)
+		return
+	}
 
 	info, err := os.Stat("prices_0.txt")
 	if err != nil {
@@ -89,37 +199,24 @@ func main() {
 
 	l := lex("start", string(prices))
 
-	c := &card{}
-
-	tx, err := db.Begin()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	stmt, err := tx.Prepare("insert into card_prices(name, set_name, buy, sell, stock, ts) values(?, ?, ?, ?, ?, ?)")
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	defer stmt.Close()
+	c := &Card{}
 
 	for {
 		item := l.nextItem()
 
 		switch item.typ {
 		case itemCardName:
-			if c.name != "" {
-				c.save(stmt, ts.String())
-				c = &card{}
+			if c.Name != "" {
+				c.save(dbmap, ts.String())
+				c = &Card{}
 			}
-			c.name = item.val
+			c.Name = item.val
 		case itemSetPrefix:
-			c.set = item.val
+			c.SetName = item.val
 		case itemBuyPrice:
-			c.buyPrice = strToFixed(item.val)
+			c.BuyPrice = strToFixed(item.val)
 		case itemSellPrice:
-			c.sellPrice = strToFixed(item.val)
+			c.SellPrice = strToFixed(item.val)
 		case itemBotCount:
 			stock, err := strconv.ParseInt(item.val, 10, 32)
 
@@ -127,13 +224,11 @@ func main() {
 				log.Fatal(err)
 			}
 
-			c.stock += int(stock)
+			c.Stock += int(stock)
 		}
 
 		if item.typ == itemEOF {
 			break
 		}
 	}
-
-	tx.Commit()
 }
