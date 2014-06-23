@@ -40,14 +40,6 @@ type item struct {
 	val string   // Value, such as "23.2".
 }
 
-type card struct {
-	name      string
-	set       string
-	buyPrice  int
-	sellPrice int
-	stock     int
-}
-
 type lexer struct {
 	name      string // used only for error reports.
 	input     string // the string being scanned.
